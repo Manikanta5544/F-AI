@@ -1,0 +1,209 @@
+version: "3.9"
+
+# ── Shared environment for backend ───────────────────────────────────────────
+x-backend-env: &backend-env
+  env_file: ./apps/api/.env
+  environment:
+    POSTGRES_HOST: postgres
+    POSTGRES_PORT: 5432
+    REDIS_HOST: redis
+    REDIS_PORT: 6379
+    REDIS_CACHE_PORT: 6380
+    REDIS_URL: redis://redis:6379/0
+    MINIO_ENDPOINT: minio:9000
+
+# ── Shared volumes ───────────────────────────────────────────────────────────
+x-backend-volumes: &backend-volumes
+  volumes:
+    - ./apps/api:/app
+    - ./models:/app/models
+
+services:
+
+  # ── PostgreSQL ─────────────────────────────────────────────────────────────
+  postgres:
+    image: ankane/pgvector:latest
+    container_name: f-ai-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: f_ai
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: Mani123
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 10
+
+  # ── Redis (Celery broker) ──────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: f-ai-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  # ── Redis cache ────────────────────────────────────────────────────────────
+  redis-cache:
+    image: redis:7-alpine
+    container_name: f-ai-redis-cache
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+
+  # ── MinIO ──────────────────────────────────────────────────────────────────
+  minio:
+    image: minio/minio:latest
+    container_name: f-ai-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      retries: 5
+
+  # ── MinIO bucket initializer ────────────────────────────────
+  minio-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb -p local/uploads || true;
+      mc mb -p local/processed || true;
+      mc mb -p local/models || true;
+      exit 0;
+      "
+
+  # ── FastAPI ────────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    container_name: f-ai-api
+    restart: unless-stopped
+    command: >
+      uvicorn app.main:app
+      --host 0.0.0.0
+      --port 8000
+      --reload
+    <<: *backend-env
+    <<: *backend-volumes
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      retries: 5
+
+  # ── Celery worker ─────────────────────────────────────────
+  worker-critical:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    container_name: f-ai-worker
+    restart: unless-stopped
+    command: >
+      celery -A app.workers.celery_app worker
+      --loglevel=info
+      -Q critical
+      --concurrency=2
+    <<: *backend-env
+    <<: *backend-volumes
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  # ── Celery worker (default queue) ──────────────────────────────────────────
+  worker-default:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    container_name: f-ai-worker-default
+    restart: unless-stopped
+    command: >
+      celery -A app.workers.celery_app worker
+      --loglevel=info
+      -Q default
+      --concurrency=4
+    <<: *backend-env
+    <<: *backend-volumes
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+  # ── Flower ─────────────────────────────────────────────────────────────────
+  flower:
+    build:
+      context: ./apps/api
+      dockerfile: Dockerfile
+    container_name: f-ai-flower
+    restart: unless-stopped
+    command: celery -A app.workers.celery_app flower --port=5555
+    <<: *backend-env
+    ports:
+      - "5555:5555"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  # ── Frontend ───────────────────────────────────────────────────────────────
+  web:
+    image: node:20-alpine
+    container_name: f-ai-web
+    working_dir: /app
+    restart: unless-stopped
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./apps/web:/app
+      - /app/node_modules
+    environment:
+      VITE_API_URL: http://localhost:8000
+      VITE_ENABLE_YOLO: "true"
+      VITE_ENABLE_OCR_ENSEMBLE: "true"
+      VITE_ENABLE_RAG: "false"
+      VITE_DEBUG_PROVENANCE: "true"
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:

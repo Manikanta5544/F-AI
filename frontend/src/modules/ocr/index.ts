@@ -1,0 +1,1 @@
+export { default as OCRPage } from './pages/OCRPage'
